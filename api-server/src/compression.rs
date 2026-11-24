@@ -1,13 +1,13 @@
 use axum::{
     body::Body,
     extract::Request,
-    http::HeaderMap,
+    http::{header::HeaderValue, HeaderMap},
     middleware::Next,
     response::Response,
 };
 use http_body_util::BodyExt;
 use serde::{Deserialize, Serialize};
-use std::io::Write;
+use std::{io::Write, str::FromStr};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompressionConfig {
@@ -47,6 +47,11 @@ pub fn compress_deflate(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
     let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
     encoder.write_all(data)?;
     encoder.finish()
+}
+
+/// Parse a negotiated encoding into a safe HTTP header value.
+fn content_encoding_header(name: &str) -> Result<HeaderValue, axum::http::header::InvalidHeaderValue> {
+    HeaderValue::from_str(name)
 }
 
 /// Middleware to handle Accept-Encoding header and apply compression
@@ -104,9 +109,20 @@ pub async fn compression_middleware(
         return Response::from_parts(parts, Body::from(bytes));
     }
 
+    // Header construction is fallible even though the current negotiated names
+    // are constants. If a future encoding cannot be represented as a header,
+    // preserve the original response instead of panicking or returning an error.
+    let content_encoding = match content_encoding_header(name) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(%error, encoding = name, "invalid Content-Encoding value; returning uncompressed response");
+            return Response::from_parts(parts, Body::from(bytes));
+        }
+    };
+
     match compress(&bytes) {
         Ok(compressed) => {
-            parts.headers.insert("Content-Encoding", name.parse().unwrap());
+            parts.headers.insert("Content-Encoding", content_encoding);
             parts.headers.remove("Content-Length");
             Response::from_parts(parts, Body::from(compressed))
         }
@@ -135,6 +151,20 @@ pub fn is_compression_supported(encoding: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_content_encoding_header_accepts_every_supported_encoding() {
+        for encoding in get_supported_compressions() {
+            let header = content_encoding_header(&encoding)
+                .unwrap_or_else(|error| panic!("supported encoding {encoding} was rejected: {error}"));
+            assert_eq!(header, encoding.as_str());
+        }
+    }
+
+    #[test]
+    fn test_content_encoding_header_rejects_invalid_value_without_panicking() {
+        assert!(content_encoding_header("gzip\\r\\nX-Injected: true").is_err());
+    }
 
     #[test]
     fn test_compression_config_default() {
